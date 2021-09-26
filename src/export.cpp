@@ -113,14 +113,18 @@ void SolveSpaceUI::ExportSectionTo(const Platform::Path &filename) {
     el.CullExtraneousEdges(/*both=*/false);
     bl.CullIdenticalBeziers(/*both=*/false);
 
+    std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> els = {};
+    els[g->h] = std::make_tuple(&el, &bl);
+
     // And write the edges.
     VectorFileWriter *out = VectorFileWriter::ForFile(filename);
     if(out) {
         // parallel projection (no perspective), and no mesh
-        ExportLinesAndMesh(&el, &bl, NULL,
+        ExportLinesAndMesh(&els, NULL,
                            u, v, n, origin, 0,
                            out);
     }
+    els.clear();
     el.Clear();
     bl.Clear();
 }
@@ -185,8 +189,7 @@ public:
 };
 
 void SolveSpaceUI::ExportViewOrWireframeTo(const Platform::Path &filename, bool exportWireframe) {
-    SEdgeList edges = {};
-    SBezierList beziers = {};
+    std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> els = {};
 
     VectorFileWriter *out = VectorFileWriter::ForFile(filename);
     if(!out) return;
@@ -204,43 +207,51 @@ void SolveSpaceUI::ExportViewOrWireframeTo(const Platform::Path &filename, bool 
         sm = NULL;
     }
 
-    for(auto &entity : SK.entity) {
-        Entity *e = &entity;
-        if(!e->IsVisible()) continue;
+    for(auto &group : SK.group) {
+        auto gedge = new SEdgeList;
+        auto gbezier = new SBezierList;
 
-        if(SS.exportPwlCurves || sm || fabs(SS.exportOffset) > LENGTH_EPS)
-        {
-            // We will be doing hidden line removal, which we can't do on
-            // exact curves; so we need things broken down to pwls. Same
-            // problem with cutter radius compensation.
-            e->GenerateEdges(&edges);
-        } else {
-            e->GenerateBezierCurves(&beziers);
-        }
-    }
 
-    if(SS.GW.showEdges || SS.GW.showOutlines) {
-        Group *g = SK.GetGroup(SS.GW.activeGroup);
-        g->GenerateDisplayItems();
-        if(SS.GW.showEdges) {
-            g->displayOutlines.ListTaggedInto(&edges, Style::SOLID_EDGE);
-        }
-    }
+        for(auto &entity : SK.entity) {
+            Entity *e = &entity;
+            if(e->group != group.h || !e->IsVisible()) continue;
 
-    if(SS.GW.showConstraints) {
-        if(!out->OutputConstraints(&SK.constraint)) {
-            GetEdgesCanvas canvas = {};
-            canvas.camera = SS.GW.GetCamera();
-            canvas.edges  = &edges;
-
-            // The output format cannot represent constraints directly,
-            // so convert them to edges.
-            for(Constraint &c : SK.constraint) {
-                c.Draw(Constraint::DrawAs::DEFAULT, &canvas);
+            if(SS.exportPwlCurves || sm || fabs(SS.exportOffset) > LENGTH_EPS)
+            {
+                // We will be doing hidden line removal, which we can't do on
+                // exact curves; so we need things broken down to pwls. Same
+                // problem with cutter radius compensation.
+                e->GenerateEdges(gedge);
+            } else {
+                e->GenerateBezierCurves(gbezier);
             }
-
-            canvas.Clear();
         }
+
+        if(SS.GW.activeGroup == group.h) {
+            if(SS.GW.showEdges || SS.GW.showOutlines) {
+                Group *g = &group;
+                g->GenerateDisplayItems();
+                if(SS.GW.showEdges) {
+                    g->displayOutlines.ListTaggedInto(gedge, Style::SOLID_EDGE);
+                }
+            }
+            if(SS.GW.showConstraints) {
+                if(!out->OutputConstraints(&SK.constraint)) {
+                    GetEdgesCanvas canvas = {};
+                    canvas.camera = SS.GW.GetCamera();
+                    canvas.edges = gedge;
+
+                    // The output format cannot represent constraints directly,
+                    // so convert them to edges.
+                    for(Constraint &c : SK.constraint) {
+                        c.Draw(Constraint::DrawAs::DEFAULT, &canvas);
+                    }
+
+                    canvas.Clear();
+                }
+            }
+        }
+        els[group.h] = std::make_tuple(gedge, gbezier);
     }
 
     if(exportWireframe) {
@@ -253,7 +264,7 @@ void SolveSpaceUI::ExportViewOrWireframeTo(const Platform::Path &filename, bool 
 
         out->SetModelviewProjection(u, v, n, origin, cameraTan, scale);
 
-        ExportWireframeCurves(&edges, &beziers, out);
+        ExportWireframeCurves(&els, out);
     } else {
         Vector u = SS.GW.projRight,
                v = SS.GW.projUp,
@@ -263,7 +274,7 @@ void SolveSpaceUI::ExportViewOrWireframeTo(const Platform::Path &filename, bool 
         out->SetModelviewProjection(u, v, n, origin,
                                     SS.CameraTangent()*SS.GW.scale, SS.exportScale);
 
-        ExportLinesAndMesh(&edges, &beziers, sm,
+        ExportLinesAndMesh(&els, sm,
                            u, v, n, origin, SS.CameraTangent()*SS.GW.scale,
                            out);
 
@@ -283,72 +294,96 @@ void SolveSpaceUI::ExportViewOrWireframeTo(const Platform::Path &filename, bool 
         GW.Invalidate();
     }
 
-    edges.Clear();
-    beziers.Clear();
+    for(auto el : els) {
+        SEdgeList *e;
+        SBezierList *b;
+        std::tie(e, b) = std::get<1>(el);
+        e->Clear();
+        b->Clear();
+        delete e;
+        delete b;
+    }
+    els.clear();
 }
 
-void SolveSpaceUI::ExportWireframeCurves(SEdgeList *sel, SBezierList *sbl,
+void SolveSpaceUI::ExportWireframeCurves(std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> *els,
                            VectorFileWriter *out)
 {
-    SBezierLoopSetSet sblss = {};
-    SEdge *se;
-    for(se = sel->l.First(); se; se = sel->l.NextAfter(se)) {
-        SBezier sb = SBezier::From(
-                                (se->a).ScaledBy(1.0 / SS.exportScale),
-                                (se->b).ScaledBy(1.0 / SS.exportScale));
-        sblss.AddOpenPath(&sb);
+    std::map<hGroup, SBezierLoopSetSet*> gsblss = {};
+    for(auto &p : *els) {
+        SEdgeList *sel;
+        SBezierList *sbl;
+        auto sblss = new SBezierLoopSetSet;
+        hGroup g = std::get<0>(p);
+        std::tie(sel, sbl) = std::get<1>(p);
+        for(auto se = sel->l.First(); se; se = sel->l.NextAfter(se)) {
+            SBezier sb = SBezier::From(
+                                    (se->a).ScaledBy(1.0 / SS.exportScale),
+                                    (se->b).ScaledBy(1.0 / SS.exportScale));
+            sblss->AddOpenPath(&sb);
+        }
+
+        sbl->ScaleSelfBy(1.0/SS.exportScale);
+        for(auto sb = sbl->l.First(); sb; sb = sbl->l.NextAfter(sb)) {
+            sblss->AddOpenPath(sb);
+        }
+        gsblss[g] = sblss;
     }
 
-    sbl->ScaleSelfBy(1.0/SS.exportScale);
-    SBezier *sb;
-    for(sb = sbl->l.First(); sb; sb = sbl->l.NextAfter(sb)) {
-        sblss.AddOpenPath(sb);
+    out->OutputLinesAndMesh(&gsblss, NULL);
+    for(auto el : gsblss) {
+        std::get<1>(el)->Clear();
+        delete std::get<1>(el);
     }
-
-    out->OutputLinesAndMesh(&sblss, NULL);
-    sblss.Clear();
+    gsblss.clear();
 }
 
-void SolveSpaceUI::ExportLinesAndMesh(SEdgeList *sel, SBezierList *sbl, SMesh *sm,
+void SolveSpaceUI::ExportLinesAndMesh(std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> *els,
+                                      SMesh *sm,
                                       Vector u, Vector v, Vector n,
                                       Vector origin, double cameraTan,
                                       VectorFileWriter *out)
 {
     double s = 1.0 / SS.exportScale;
 
-    // Project into the export plane; so when we're done, z doesn't matter,
-    // and x and y are what goes in the DXF.
-    for(SEdge *e = sel->l.First(); e; e = sel->l.NextAfter(e)) {
-        // project into the specified csys, and apply export scale
-        (e->a) = e->a.InPerspective(u, v, n, origin, cameraTan).ScaledBy(s);
-        (e->b) = e->b.InPerspective(u, v, n, origin, cameraTan).ScaledBy(s);
-    }
+    for(auto &p : *els) {
+        SEdgeList *sel;
+        SBezierList *sbl;
+        std::tie(sel, sbl) = std::get<1>(p);
+        // Project into the export plane; so when we're done, z doesn't matter,
+        // and x and y are what goes in the DXF.
+        for(SEdge *e = sel->l.First(); e; e = sel->l.NextAfter(e)) {
+            // project into the specified csys, and apply export scale
+            (e->a) = e->a.InPerspective(u, v, n, origin, cameraTan).ScaledBy(s);
+            (e->b) = e->b.InPerspective(u, v, n, origin, cameraTan).ScaledBy(s);
+        }
 
-    if(sbl) {
-        for(SBezier *b = sbl->l.First(); b; b = sbl->l.NextAfter(b)) {
-            *b = b->InPerspective(u, v, n, origin, cameraTan);
-            int i;
-            for(i = 0; i <= b->deg; i++) {
-                b->ctrl[i] = (b->ctrl[i]).ScaledBy(s);
+        if(sbl) {
+            for(SBezier *b = sbl->l.First(); b; b = sbl->l.NextAfter(b)) {
+                *b = b->InPerspective(u, v, n, origin, cameraTan);
+                int i;
+                for(i = 0; i <= b->deg; i++) {
+                    b->ctrl[i] = (b->ctrl[i]).ScaledBy(s);
+                }
             }
         }
-    }
 
-    // If cutter radius compensation is requested, then perform it now
-    if(fabs(SS.exportOffset) > LENGTH_EPS) {
-        // assemble those edges into a polygon, and clear the edge list
-        SPolygon sp = {};
-        sel->AssemblePolygon(&sp, NULL);
-        sel->Clear();
+        // If cutter radius compensation is requested, then perform it now
+        if(fabs(SS.exportOffset) > LENGTH_EPS) {
+            // assemble those edges into a polygon, and clear the edge list
+            SPolygon sp = {};
+            sel->AssemblePolygon(&sp, NULL);
+            sel->Clear();
 
-        SPolygon compd = {};
-        sp.normal = Vector::From(0, 0, -1);
-        sp.FixContourDirections();
-        sp.OffsetInto(&compd, SS.exportOffset*s);
-        sp.Clear();
+            SPolygon compd = {};
+            sp.normal = Vector::From(0, 0, -1);
+            sp.FixContourDirections();
+            sp.OffsetInto(&compd, SS.exportOffset*s);
+            sp.Clear();
 
-        compd.MakeEdgesInto(sel);
-        compd.Clear();
+            compd.MakeEdgesInto(sel);
+            compd.Clear();
+        }
     }
 
     // Now the triangle mesh; project, then build a BSP to perform
@@ -402,212 +437,230 @@ void SolveSpaceUI::ExportLinesAndMesh(SEdgeList *sel, SBezierList *sbl, SMesh *s
     if(sm) {
         SKdNode *root = SKdNode::From(&smp);
 
-        // Generate the edges where a curved surface turns from front-facing
-        // to back-facing.
-        if(SS.GW.showEdges || SS.GW.showOutlines) {
-            root->MakeCertainEdgesInto(sel, EdgeKind::TURNING,
-                                       /*coplanarIsInter=*/false, NULL, NULL,
-                                       GW.showOutlines ? Style::OUTLINE : Style::SOLID_EDGE);
-        }
+        for(auto &p : *els) {
+            SEdgeList *sel;
+            SBezierList *sbl;
+            std::tie(sel, sbl) = std::get<1>(p);
 
-        root->ClearTags();
-        int cnt = 1234;
-
-        SEdge *se;
-        for(se = sel->l.First(); se; se = sel->l.NextAfter(se)) {
-            if(se->auxA == Style::CONSTRAINT) {
-                // Constraints should not get hidden line removed; they're
-                // always on top.
-                hlrd.AddEdge(se->a, se->b, se->auxA);
-                continue;
+            // Generate the edges where a curved surface turns from front-facing
+            // to back-facing.
+            if(SS.GW.showEdges || SS.GW.showOutlines) {
+                root->MakeCertainEdgesInto(sel, EdgeKind::TURNING,
+                                           /*coplanarIsInter=*/false, NULL, NULL,
+                                           GW.showOutlines ? Style::OUTLINE : Style::SOLID_EDGE);
             }
 
-            SEdgeList edges = {};
-            // Split the original edge against the mesh
-            edges.AddEdge(se->a, se->b, se->auxA);
-            root->OcclusionTestLine(*se, &edges, cnt);
-            if(SS.GW.drawOccludedAs == GraphicsWindow::DrawOccludedAs::STIPPLED) {
-                for(SEdge &se : edges.l) {
-                    if(se.tag == 1) {
-                        se.auxA = Style::HIDDEN_EDGE;
-                    }
+            root->ClearTags();
+            int cnt = 1234;
+
+            SEdge *se;
+            for(se = sel->l.First(); se; se = sel->l.NextAfter(se)) {
+                if(se->auxA == Style::CONSTRAINT) {
+                    // Constraints should not get hidden line removed; they're
+                    // always on top.
+                    hlrd.AddEdge(se->a, se->b, se->auxA);
+                    continue;
                 }
-            } else if(SS.GW.drawOccludedAs == GraphicsWindow::DrawOccludedAs::INVISIBLE) {
-                edges.l.RemoveTagged();
+
+                SEdgeList edges = {};
+                // Split the original edge against the mesh
+                edges.AddEdge(se->a, se->b, se->auxA);
+                root->OcclusionTestLine(*se, &edges, cnt);
+                if(SS.GW.drawOccludedAs == GraphicsWindow::DrawOccludedAs::STIPPLED) {
+                    for(SEdge &se : edges.l) {
+                        if(se.tag == 1) {
+                            se.auxA = Style::HIDDEN_EDGE;
+                        }
+                    }
+                } else if(SS.GW.drawOccludedAs == GraphicsWindow::DrawOccludedAs::INVISIBLE) {
+                    edges.l.RemoveTagged();
+                }
+
+                // the occlusion test splits unnecessarily; so fix those
+                edges.MergeCollinearSegments(se->a, se->b);
+                cnt++;
+                // And add the results to our output
+                SEdge *sen;
+                for(sen = edges.l.First(); sen; sen = edges.l.NextAfter(sen)) {
+                    hlrd.AddEdge(sen->a, sen->b, sen->auxA);
+                }
+                edges.Clear();
             }
 
-            // the occlusion test splits unnecessarily; so fix those
-            edges.MergeCollinearSegments(se->a, se->b);
-            cnt++;
-            // And add the results to our output
-            SEdge *sen;
-            for(sen = edges.l.First(); sen; sen = edges.l.NextAfter(sen)) {
-                hlrd.AddEdge(sen->a, sen->b, sen->auxA);
-            }
-            edges.Clear();
+            sel = &hlrd;
         }
-
-        sel = &hlrd;
     }
 
-    // Clean up: remove overlapping line segments and
-    // segments with zero-length projections.
-    sel->l.ClearTags();
-    for(int i = 0; i < sel->l.n; ++i) {
-        SEdge *sei = &sel->l[i];
-        hStyle hsi = { (uint32_t)sei->auxA };
-        Style *si = Style::Get(hsi);
-        if(sei->tag != 0) continue;
-
-        // Remove segments with zero length projections.
-        Vector ai = sei->a;
-        ai.z = 0.0;
-        Vector bi = sei->b;
-        bi.z = 0.0;
-        Vector di = bi.Minus(ai);
-        if(fabs(di.x) < LENGTH_EPS && fabs(di.y) < LENGTH_EPS) {
-            sei->tag = 1;
-            continue;
-        }
-
-        for(int j = i + 1; j < sel->l.n; ++j) {
-            SEdge *sej = &sel->l[j];
-            if(sej->tag != 0) continue;
-
-            Vector *pAj = &sej->a;
-            Vector *pBj = &sej->b;
+    std::map<hGroup, SBezierLoopSetSet*> gsblss = {};
+    for(auto &p : *els) {
+        SEdgeList *sel;
+        SBezierList *sbl;
+        std::tie(sel, sbl) = std::get<1>(p);
+        // Clean up: remove overlapping line segments and
+        // segments with zero-length projections.
+        sel->l.ClearTags();
+        for(int i = 0; i < sel->l.n; ++i) {
+            SEdge *sei = &sel->l[i];
+            hStyle hsi = { (uint32_t)sei->auxA };
+            Style *si = Style::Get(hsi);
+            if(sei->tag != 0) continue;
 
             // Remove segments with zero length projections.
-            Vector aj = sej->a;
-            aj.z = 0.0;
-            Vector bj = sej->b;
-            bj.z = 0.0;
-            Vector dj = bj.Minus(aj);
-            if(fabs(dj.x) < LENGTH_EPS && fabs(dj.y) < LENGTH_EPS) {
-                sej->tag = 1;
+            Vector ai = sei->a;
+            ai.z = 0.0;
+            Vector bi = sei->b;
+            bi.z = 0.0;
+            Vector di = bi.Minus(ai);
+            if(fabs(di.x) < LENGTH_EPS && fabs(di.y) < LENGTH_EPS) {
+                sei->tag = 1;
                 continue;
             }
 
-            // Skip non-collinear segments.
-            const double eps = 1e-6;
-            if(aj.DistanceToLine(ai, di) > eps) continue;
-            if(bj.DistanceToLine(ai, di) > eps) continue;
+            for(int j = i + 1; j < sel->l.n; ++j) {
+                SEdge *sej = &sel->l[j];
+                if(sej->tag != 0) continue;
 
-            double ta = aj.Minus(ai).Dot(di) / di.Dot(di);
-            double tb = bj.Minus(ai).Dot(di) / di.Dot(di);
-            if(ta > tb) {
-                std::swap(pAj, pBj);
-                std::swap(ta, tb);
-            }
+                Vector *pAj = &sej->a;
+                Vector *pBj = &sej->b;
 
-            hStyle hsj = { (uint32_t)sej->auxA };
-            Style *sj = Style::Get(hsj);
-
-            bool canRemoveI = sej->auxA == sei->auxA || si->zIndex < sj->zIndex;
-            bool canRemoveJ = sej->auxA == sei->auxA || sj->zIndex < si->zIndex;
-
-            if(canRemoveJ) {
-                // j-segment inside i-segment
-                if(ta > 0.0 - eps && tb < 1.0 + eps) {
+                // Remove segments with zero length projections.
+                Vector aj = sej->a;
+                aj.z = 0.0;
+                Vector bj = sej->b;
+                bj.z = 0.0;
+                Vector dj = bj.Minus(aj);
+                if(fabs(dj.x) < LENGTH_EPS && fabs(dj.y) < LENGTH_EPS) {
                     sej->tag = 1;
                     continue;
                 }
 
-                // cut segment
-                bool aInside = ta > 0.0 - eps && ta < 1.0 + eps;
-                if(tb > 1.0 - eps && aInside) {
-                    *pAj = sei->b;
-                    continue;
+                // Skip non-collinear segments.
+                const double eps = 1e-6;
+                if(aj.DistanceToLine(ai, di) > eps) continue;
+                if(bj.DistanceToLine(ai, di) > eps) continue;
+
+                double ta = aj.Minus(ai).Dot(di) / di.Dot(di);
+                double tb = bj.Minus(ai).Dot(di) / di.Dot(di);
+                if(ta > tb) {
+                    std::swap(pAj, pBj);
+                    std::swap(ta, tb);
                 }
 
-                // cut segment
-                bool bInside = tb > 0.0 - eps && tb < 1.0 + eps;
-                if(ta < 0.0 - eps && bInside) {
-                    *pBj = sei->a;
-                    continue;
+                hStyle hsj = { (uint32_t)sej->auxA };
+                Style *sj = Style::Get(hsj);
+
+                bool canRemoveI = sej->auxA == sei->auxA || si->zIndex < sj->zIndex;
+                bool canRemoveJ = sej->auxA == sei->auxA || sj->zIndex < si->zIndex;
+
+                if(canRemoveJ) {
+                    // j-segment inside i-segment
+                    if(ta > 0.0 - eps && tb < 1.0 + eps) {
+                        sej->tag = 1;
+                        continue;
+                    }
+
+                    // cut segment
+                    bool aInside = ta > 0.0 - eps && ta < 1.0 + eps;
+                    if(tb > 1.0 - eps && aInside) {
+                        *pAj = sei->b;
+                        continue;
+                    }
+
+                    // cut segment
+                    bool bInside = tb > 0.0 - eps && tb < 1.0 + eps;
+                    if(ta < 0.0 - eps && bInside) {
+                        *pBj = sei->a;
+                        continue;
+                    }
+
+                    // split segment
+                    if(ta < 0.0 - eps && tb > 1.0 + eps) {
+                        sel->AddEdge(sei->b, *pBj, sej->auxA, sej->auxB);
+                        *pBj = sei->a;
+                        continue;
+                    }
                 }
 
-                // split segment
-                if(ta < 0.0 - eps && tb > 1.0 + eps) {
-                    sel->AddEdge(sei->b, *pBj, sej->auxA, sej->auxB);
-                    *pBj = sei->a;
-                    continue;
-                }
-            }
+                if(canRemoveI) {
+                    // j-segment inside i-segment
+                    if(ta < 0.0 + eps && tb > 1.0 - eps) {
+                        sei->tag = 1;
+                        break;
+                    }
 
-            if(canRemoveI) {
-                // j-segment inside i-segment
-                if(ta < 0.0 + eps && tb > 1.0 - eps) {
-                    sei->tag = 1;
-                    break;
-                }
+                    // cut segment
+                    bool aInside = ta > 0.0 + eps && ta < 1.0 - eps;
+                    if(tb > 1.0 - eps && aInside) {
+                        sei->b = *pAj;
+                        i--;
+                        break;
+                    }
 
-                // cut segment
-                bool aInside = ta > 0.0 + eps && ta < 1.0 - eps;
-                if(tb > 1.0 - eps && aInside) {
-                    sei->b = *pAj;
-                    i--;
-                    break;
-                }
+                    // cut segment
+                    bool bInside = tb > 0.0 + eps && tb < 1.0 - eps;
+                    if(ta < 0.0 + eps && bInside) {
+                        sei->a = *pBj;
+                        i--;
+                        break;
+                    }
 
-                // cut segment
-                bool bInside = tb > 0.0 + eps && tb < 1.0 - eps;
-                if(ta < 0.0 + eps && bInside) {
-                    sei->a = *pBj;
-                    i--;
-                    break;
-                }
-
-                // split segment
-                if(ta > 0.0 + eps && tb < 1.0 - eps) {
-                    sel->AddEdge(*pBj, sei->b, sei->auxA, sei->auxB);
-                    sei->b = *pAj;
-                    i--;
-                    break;
+                    // split segment
+                    if(ta > 0.0 + eps && tb < 1.0 - eps) {
+                        sel->AddEdge(*pBj, sei->b, sei->auxA, sei->auxB);
+                        sei->b = *pAj;
+                        i--;
+                        break;
+                    }
                 }
             }
         }
-    }
-    sel->l.RemoveTagged();
+        sel->l.RemoveTagged();
 
-    // We kept the line segments and Beziers separate until now; but put them
-    // all together, and also project everything into the xy plane, since not
-    // all export targets ignore the z component of the points.
-    ssassert(sbl != nullptr, "Adding line segments to beziers assumes bezier list is non-null.");
-    for(SEdge *e = sel->l.First(); e; e = sel->l.NextAfter(e)) {
-        SBezier sb = SBezier::From(e->a, e->b);
-        sb.auxA = e->auxA;
-        sbl->l.Add(&sb);
-    }
-    for(SBezier *b = sbl->l.First(); b; b = sbl->l.NextAfter(b)) {
-        for(int i = 0; i <= b->deg; i++) {
-            b->ctrl[i].z = 0;
+        // We kept the line segments and Beziers separate until now; but put them
+        // all together, and also project everything into the xy plane, since not
+        // all export targets ignore the z component of the points.
+        ssassert(sbl != nullptr, "Adding line segments to beziers assumes bezier list is non-null.");
+        for(SEdge *e = sel->l.First(); e; e = sel->l.NextAfter(e)) {
+            SBezier sb = SBezier::From(e->a, e->b);
+            sb.auxA = e->auxA;
+            sbl->l.Add(&sb);
         }
-    }
+        for(SBezier *b = sbl->l.First(); b; b = sbl->l.NextAfter(b)) {
+            for(int i = 0; i <= b->deg; i++) {
+                b->ctrl[i].z = 0;
+            }
+        }
 
-    // If possible, then we will assemble these output curves into loops. They
-    // will then get exported as closed paths.
-    SBezierLoopSetSet sblss = {};
-    SBezierLoopSet leftovers = {};
-    SSurface srf = SSurface::FromPlane(Vector::From(0, 0, 0),
-                                       Vector::From(1, 0, 0),
-                                       Vector::From(0, 1, 0));
-    SPolygon spxyz = {};
-    bool allClosed;
-    SEdge notClosedAt;
-    sbl->l.ClearTags();
-    sblss.FindOuterFacesFrom(sbl, &spxyz, &srf,
-                             SS.ExportChordTolMm(),
-                             &allClosed, &notClosedAt,
-                             NULL, NULL,
-                             &leftovers);
-    sblss.l.Add(&leftovers);
+        // If possible, then we will assemble these output curves into loops. They
+        // will then get exported as closed paths.
+        auto sblss = new SBezierLoopSetSet;
+        auto leftovers = new SBezierLoopSet;
+        SSurface srf = SSurface::FromPlane(Vector::From(0, 0, 0),
+                                           Vector::From(1, 0, 0),
+                                           Vector::From(0, 1, 0));
+        SPolygon spxyz = {};
+        bool allClosed;
+        SEdge notClosedAt;
+        sbl->l.ClearTags();
+        sblss->FindOuterFacesFrom(sbl, &spxyz, &srf,
+                                 SS.ExportChordTolMm(),
+                                 &allClosed, &notClosedAt,
+                                 NULL, NULL,
+                                 leftovers);
+        sblss->l.Add(leftovers);
+        gsblss[std::get<0>(p)] = sblss;
+        spxyz.Clear();
+    }
 
     // Now write the lines and triangles to the output file
-    out->OutputLinesAndMesh(&sblss, &sms);
+    out->OutputLinesAndMesh(&gsblss, &sms);
+    for(auto el : gsblss) {
+        auto s = std::get<1>(el);
+        s->Clear();
+        delete s;
+    }
+    gsblss.clear();
 
-    spxyz.Clear();
-    sblss.Clear();
     smp.Clear();
     sms.Clear();
     hlrd.Clear();
@@ -678,7 +731,7 @@ Vector VectorFileWriter::Transform(Vector &pos) const {
     return pos.InPerspective(u, v, n, origin, cameraTan).ScaledBy(1.0 / scale);
 }
 
-void VectorFileWriter::OutputLinesAndMesh(SBezierLoopSetSet *sblss, SMesh *sm) {
+void VectorFileWriter::OutputLinesAndMesh(std::map<hGroup, SBezierLoopSetSet*> *gsblss, SMesh *sm) {
     STriangle *tr;
     SBezier *b;
 
@@ -692,7 +745,11 @@ void VectorFileWriter::OutputLinesAndMesh(SBezierLoopSetSet *sblss, SMesh *sm) {
             (tr->c).MakeMaxMin(&ptMax, &ptMin);
         }
     }
-    if(sblss) {
+
+    for(auto &el : *gsblss) {
+        SBezierLoopSetSet *sblss = std::get<1>(el);
+        if(!sblss) continue;
+
         SBezierLoopSet *sbls;
         for(sbls = sblss->l.First(); sbls; sbls = sblss->l.NextAfter(sbls)) {
             SBezierLoop *sbl;
@@ -731,7 +788,16 @@ void VectorFileWriter::OutputLinesAndMesh(SBezierLoopSetSet *sblss, SMesh *sm) {
             Triangle(tr);
         }
     }
-    if(sblss) {
+
+    for(auto &el : *gsblss) {
+        hGroup h = std::get<0>(el);
+        Group *grp = nullptr;
+        if (h.v != 0) grp = SK.group.FindById(h);
+        if (grp) StartGroup(grp);
+        SBezierLoopSetSet *sblss = std::get<1>(el);
+
+        if(!sblss) continue;
+
         SBezierLoopSet *sbls;
         for(sbls = sblss->l.First(); sbls; sbls = sblss->l.NextAfter(sbls)) {
             for(SBezierLoop *sbl = sbls->l.First(); sbl; sbl = sbls->l.NextAfter(sbl)) {
@@ -751,6 +817,7 @@ void VectorFileWriter::OutputLinesAndMesh(SBezierLoopSetSet *sblss, SMesh *sm) {
                 FinishPath(strokeRgb, lineWidth, stl->filled, fillRgb, hs);
             }
         }
+        if (grp) FinishGroup(grp);
     }
     FinishAndCloseFile();
 }

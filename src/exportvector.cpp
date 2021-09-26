@@ -1128,6 +1128,16 @@ void SvgFileWriter::Background(RgbaColor color) {
         color.red, color.green, color.blue);
 }
 
+void SvgFileWriter::StartGroup(Group *g)
+{
+    fprintf(f, "<g id='%x'>\r\n<title>%s</title>\r\n", g->h.v, g->name.c_str());
+}
+
+void SvgFileWriter::FinishGroup(Group *g)
+{
+    fprintf(f, "</g>\r\n");
+}
+
 void SvgFileWriter::StartPath(RgbaColor strokeRgb, double lineWidth,
                               bool filled, RgbaColor fillRgb, hStyle hs)
 {

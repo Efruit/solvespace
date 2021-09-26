@@ -329,11 +329,13 @@ public:
                                 const Vector &origin, double cameraTan, double scale);
     Vector Transform(Vector &pos) const;
 
-    void OutputLinesAndMesh(SBezierLoopSetSet *sblss, SMesh *sm);
+    void OutputLinesAndMesh(std::map<hGroup, SBezierLoopSetSet*> *gsblss, SMesh *sm);
 
     void BezierAsPwl(SBezier *sb);
     void BezierAsNonrationalCubic(SBezier *sb, int depth=0);
 
+    virtual void StartGroup(Group *g) { return; };
+    virtual void FinishGroup(Group *g) { return; };
     virtual void StartPath(RgbaColor strokeRgb, double lineWidth,
                             bool filled, RgbaColor fillRgb, hStyle hs) = 0;
     virtual void FinishPath(RgbaColor strokeRgb, double lineWidth,
@@ -414,6 +416,8 @@ public:
     Vector prevPt;
     void MaybeMoveTo(Vector s, Vector f);
 
+    void StartGroup(Group *g) override;
+    void FinishGroup(Group *g) override;
     void StartPath( RgbaColor strokeRgb, double lineWidth,
                     bool filled, RgbaColor fillRgb, hStyle hs) override;
     void FinishPath(RgbaColor strokeRgb, double lineWidth,
@@ -695,9 +699,10 @@ public:
     void ExportMeshAsVrmlTo(FILE *f, const Platform::Path &filename, SMesh *sm);
     void ExportViewOrWireframeTo(const Platform::Path &filename, bool exportWireframe);
     void ExportSectionTo(const Platform::Path &filename);
-    void ExportWireframeCurves(SEdgeList *sel, SBezierList *sbl,
+    void ExportWireframeCurves(std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> *els,
                                VectorFileWriter *out);
-    void ExportLinesAndMesh(SEdgeList *sel, SBezierList *sbl, SMesh *sm,
+    void ExportLinesAndMesh(std::map<hGroup, std::tuple<SEdgeList*, SBezierList*>> *els,
+                            SMesh *sm,
                             Vector u, Vector v,
                             Vector n, Vector origin,
                             double cameraTan,
